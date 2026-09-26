@@ -18,6 +18,9 @@ import { validateBoard } from './validation.js';
  *  2. 回溯时严格按行优先顺序、数字从小到大分支 —— 因此找到的前两个解
  *     恰好就是行优先字典序最小的两份完整填法；
  *  3. 一旦找到第二个解立即停止（status: 'multiple'）。
+ *
+ * search 是底层搜索原语（可带固定条件、可限定见证份数）；
+ * solve（唯一性分析）与 hint.ts 的 safeHint（安全提示）都建立在它之上。
  */
 
 export type SolveStatus = 'unsat' | 'unique' | 'multiple' | 'limit';
@@ -38,7 +41,7 @@ export interface SolveResult {
 
 export const DIGIT_MASK_ALL = ((1 << (MAX_DIGIT + 1)) - 1) & ~1; // 位 1..9
 
-const DEFAULT_NODE_LIMIT = 500_000;
+export const DEFAULT_NODE_LIMIT = 500_000;
 
 interface PreparedRun extends Run {
   combos: number[][];
@@ -258,32 +261,71 @@ function initialDomains(p: PreparedPuzzle): Uint16Array {
   return domains;
 }
 
-/**
- * 求解。最多收集两个见证（行优先字典序最小的两个）。
- */
-export function solve(
-  boardOrPrepared: Board | PreparedPuzzle,
-  nodeLimit = DEFAULT_NODE_LIMIT
-): SolveResult {
-  let p: PreparedPuzzle;
+/** 把 Board 规格化为 PreparedPuzzle（已规格化的直接透传）。 */
+export function asPrepared(boardOrPrepared: Board | PreparedPuzzle): PreparedPuzzle {
   const obj = boardOrPrepared as Partial<PreparedPuzzle>;
   if (Array.isArray(obj.runs) && Array.isArray(obj.whiteCells)) {
-    p = boardOrPrepared as PreparedPuzzle;
-  } else {
-    const prep = preparePuzzle(boardOrPrepared as Board);
-    if ('error' in prep) throw new Error(prep.error);
-    p = prep;
+    return boardOrPrepared as PreparedPuzzle;
   }
+  const prep = preparePuzzle(boardOrPrepared as Board);
+  if ('error' in prep) throw new Error(prep.error);
+  return prep;
+}
+
+export interface SearchOptions {
+  nodeLimit?: number;
+  /** 最多收集的见证份数（默认 2；存在性查询用 1，找到即停）。 */
+  maxWitnesses?: number;
+  /**
+   * 固定条件：盘面格索引 -> 数字 1～9。
+   * 非白格或越界数字会被忽略；固定条件之间/与线索冲突时表现为无解。
+   */
+  fixed?: ReadonlyMap<number, number>;
+}
+
+export interface SearchResult {
+  /** 至多 maxWitnesses 份见证填法（行优先字典序最小）；长度 = 白格总数。 */
+  witnesses: number[][];
+  /** 搜索是否因节点上限被截断；截断时“没找到”不等于“不存在”。 */
+  limitHit: boolean;
+  /**
+   * 初始传播（含固定条件）结束后每格剩余候选的位掩码；
+   * 墙格为 0。无解时为传播到矛盾前的最后状态（可能含 0 掩码格）。
+   */
+  domains: number[];
+  /** 传播是否独立收敛为单值。 */
+  propagationSolved: boolean;
+  nodes: number;
+}
+
+/**
+ * 搜索原语：在可选的固定条件下收集至多 maxWitnesses 份见证。
+ * solve（唯一性分析）与 safeHint（安全提示）共用同一实现。
+ */
+export function search(
+  boardOrPrepared: Board | PreparedPuzzle,
+  options: SearchOptions = {}
+): SearchResult {
+  const nodeLimit = options.nodeLimit ?? DEFAULT_NODE_LIMIT;
+  const maxWitnesses = Math.max(1, options.maxWitnesses ?? 2);
+  const p = asPrepared(boardOrPrepared);
 
   const baseDomains = initialDomains(p);
+  if (options.fixed) {
+    for (const [cell, d] of options.fixed) {
+      if (!Number.isInteger(d) || d < MIN_DIGIT || d > MAX_DIGIT) continue;
+      if (p.board.cells[cell]?.type !== 'white') continue;
+      baseDomains[cell] = 1 << d;
+    }
+  }
   let propagatedDomains: Uint16Array;
   try {
     propagate(p, baseDomains, p.runs.map((_, i) => i));
     propagatedDomains = baseDomains;
   } catch {
     return {
-      status: 'unsat',
       witnesses: [],
+      limitHit: false,
       domains: Array.from(baseDomains),
       propagationSolved: false,
       nodes: 0
@@ -320,7 +362,7 @@ export function solve(
   };
 
   const dfs = (domains: Uint16Array, nextWhite: number): void => {
-    if (witnesses.length >= 2 || limitHit) return;
+    if (witnesses.length >= maxWitnesses || limitHit) return;
     nodes++;
     if (nodes > nodeLimit) {
       limitHit = true;
@@ -348,27 +390,41 @@ export function solve(
         continue;
       }
       dfs(child, wi + 1);
-      if (witnesses.length >= 2 || limitHit) return;
+      if (witnesses.length >= maxWitnesses || limitHit) return;
     }
   };
 
   dfs(propagatedDomains.slice(), 0);
 
-  if (limitHit) {
-    return {
-      status: 'limit',
-      witnesses,
-      domains: Array.from(propagatedDomains),
-      propagationSolved: allSingletons,
-      nodes
-    };
-  }
   return {
-    status: witnesses.length === 0 ? 'unsat' : witnesses.length === 1 ? 'unique' : 'multiple',
     witnesses,
+    limitHit,
     domains: Array.from(propagatedDomains),
     propagationSolved: allSingletons,
     nodes
+  };
+}
+
+/**
+ * 求解。最多收集两个见证（行优先字典序最小的两个）。
+ */
+export function solve(
+  boardOrPrepared: Board | PreparedPuzzle,
+  nodeLimit = DEFAULT_NODE_LIMIT
+): SolveResult {
+  const r = search(boardOrPrepared, { nodeLimit, maxWitnesses: 2 });
+  return {
+    status: r.limitHit
+      ? 'limit'
+      : r.witnesses.length === 0
+        ? 'unsat'
+        : r.witnesses.length === 1
+          ? 'unique'
+          : 'multiple',
+    witnesses: r.witnesses,
+    domains: r.domains,
+    propagationSolved: r.propagationSolved,
+    nodes: r.nodes
   };
 }
 

@@ -306,6 +306,12 @@ td.white.selected {
   border-color: #f0d3ad;
 }
 
+.result-banner.none {
+  color: var(--ink-soft);
+  background: #f0f2f5;
+  border-color: var(--line);
+}
+
 .result-banner.stale {
   opacity: 0.55;
 }

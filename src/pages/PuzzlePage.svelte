@@ -1,13 +1,23 @@
 <script lang="ts">
   import type { Board } from '../lib/types';
-  import { isWall } from '../lib/types';
+  import { colOf, isWall, rowOf } from '../lib/types';
   import { validateBoard } from '../lib/validation';
-  import { preparePuzzle, solve, maskToDigits, type SolveResult } from '../lib/solver';
+  import {
+    DEFAULT_NODE_LIMIT,
+    preparePuzzle,
+    solve,
+    maskToDigits,
+    type SolveResult
+  } from '../lib/solver';
+  import { safeHint, type SafeHintResult } from '../lib/hint';
   import { deserialize, serialize } from '../lib/stores/boardStore';
   import WitnessGrid from '../components/WitnessGrid.svelte';
   import { SAMPLE_BOARD } from '../lib/sample';
 
   const STORAGE_KEY = 'kakuro-published-board';
+
+  /** 每次存在性查询的节点上限（测试可注入更小值以覆盖超限分支）。 */
+  export let hintNodeLimit: number = DEFAULT_NODE_LIMIT;
 
   let board: Board = loadInitial();
   let entries: string[] = board.cells.map(() => '');
@@ -16,6 +26,8 @@
   let solution: SolveResult | null = null;
   let showSolution = false;
   let selected = -1;
+  let hint: SafeHintResult | null = null;
+  let hintBasis = '';
 
   function loadInitial(): Board {
     try {
@@ -29,6 +41,10 @@
 
   $: validation = validateBoard(board);
   $: whiteIndices = board.cells.map((c, i) => (c.type === 'white' ? i : -1)).filter((i) => i >= 0);
+
+  // 棋盘、线索或任一已填数字变化 → 指纹改变 → 旧提示立即失效。
+  $: boardFingerprint = JSON.stringify([board, entries]);
+  $: if (hint !== null && hintBasis !== boardFingerprint) hint = null;
 
   // 冲突检测：同线重复 / 已填满但和不等。
   $: conflictCells = new Set<number>();
@@ -124,6 +140,24 @@
     solution = solve(prep);
   }
 
+  // 安全提示：只预览，玩家确认后才填入；结果同时驱动横幅与格子高亮。
+  function requestHint() {
+    if (!validation.ok) return;
+    hintBasis = boardFingerprint;
+    hint = safeHint(
+      board,
+      entries.map((x) => (x === '' ? null : Number(x))),
+      hintNodeLimit
+    );
+  }
+
+  function confirmHint() {
+    if (!hint || hint.status !== 'hint' || hint.cell === null || hint.digit === null) return;
+    const { cell, digit } = hint;
+    entries = entries.map((x, i) => (i === cell ? String(digit) : x));
+    // entries 变化使指纹改变，本次提示随之自动失效。
+  }
+
   function candidateList(cell: number): number[] {
     if (!solution) return [];
     return maskToDigits(solution.domains[cell]);
@@ -174,16 +208,21 @@
                     class:conflict={conflictCells.has(i)}
                     class:wrong={inWrongRun}
                     class:selected={selected === i}
+                    class:hinted={hint !== null && hint.status === 'hint' && hint.cell === i}
                   >
                     <input
                       class="digit-input"
                       type="text"
                       inputmode="numeric"
                       maxlength="1"
+                      aria-label={`第${r + 1}行第${c + 1}列`}
                       value={entries[i]}
                       on:focus={() => (selected = i)}
                       on:input={(e) => onDigit(i, e.currentTarget)}
                     />
+                    {#if hint !== null && hint.status === 'hint' && hint.cell === i}
+                      <span class="hint-ghost">{hint.digit}</span>
+                    {/if}
                     {#if selected === i && solution}
                       <div class="cand-popup">
                         候选：{candidateList(i).length ? candidateList(i).join(' ') : '空'}
@@ -200,6 +239,7 @@
       <div class="toolbar" style="margin-top: 12px">
         <button on:click={clearEntries}>清空填写</button>
         <button class="primary" on:click={analyze} disabled={!validation.ok}>求解 / 唯一性分析</button>
+        <button on:click={requestHint} disabled={!validation.ok}>安全提示</button>
         {#if allFilled}
           {#if solved}
             <span style="color: var(--ok); font-weight: 700">🎉 全部完成，答案正确！</span>
@@ -210,6 +250,31 @@
           <span class="muted">已满足线段：{completeCount}/{totalRuns}</span>
         {/if}
       </div>
+
+      {#if hint}
+        {#if hint.status === 'contradiction'}
+          <div class="result-banner unsat">
+            当前填写与线索矛盾：已不存在任何完整合法填法。你的输入保持原样，请检查标红的冲突格。
+          </div>
+        {:else if hint.status === 'unknown'}
+          <div class="result-banner limit">
+            搜索触及上限，暂时无法确定安全提示（结果未知，不代表无解）。可以稍后再试。
+          </div>
+        {:else if hint.status === 'none'}
+          <div class="result-banner none">
+            暂无线索：当前局面下，没有任何空格能被所有可行填法唯一确定。
+          </div>
+        {:else if hint.status === 'hint' && hint.cell !== null && hint.digit !== null}
+          <div class="hint-preview">
+            <span>
+              安全提示：第 {rowOf(board, hint.cell) + 1} 行第 {colOf(board, hint.cell) + 1} 列可以填
+              <strong>{hint.digit}</strong>（所有可行填法在此格都取该数字）。
+            </span>
+            <button class="primary" on:click={confirmHint}>填入</button>
+            <button on:click={() => (hint = null)}>取消</button>
+          </div>
+        {/if}
+      {/if}
     </div>
 
     {#if solution && showSolution}
@@ -319,6 +384,35 @@
   td.selected {
     outline: 3px solid var(--accent);
     outline-offset: -3px;
+  }
+  td.hinted {
+    outline: 3px solid var(--ok);
+    outline-offset: -3px;
+  }
+  .hint-ghost {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--ok);
+    opacity: 0.5;
+    pointer-events: none;
+  }
+  .hint-preview {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    border: 1px solid #bfe4d2;
+    background: #e9f7f0;
+    color: var(--ok);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-weight: 600;
+    margin-bottom: 10px;
   }
   .cand-popup {
     position: absolute;
