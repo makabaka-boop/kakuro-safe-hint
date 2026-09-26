@@ -1,0 +1,16 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kakuro-studio:latest
+    container_name: kakuro-studio
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+    # puzzle 页面：http://localhost:8080/#/puzzle
+    # 编辑器页面：http://localhost:8080/#/editor
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run

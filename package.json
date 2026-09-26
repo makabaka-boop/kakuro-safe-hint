@@ -1,0 +1,25 @@
+{
+  "name": "kakuro-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Offline Kakuro editor with uniqueness analysis (Svelte + TypeScript)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^3.1.2",
+    "@tsconfig/svelte": "^5.0.4",
+    "svelte": "^4.2.19",
+    "svelte-check": "^3.8.6",
+    "tslib": "^2.7.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.8",
+    "vitest": "^2.1.1"
+  }
+}
