@@ -1,9 +1,10 @@
 <script lang="ts">
   import type { Board } from '../lib/types';
-  import { isWall } from '../lib/types';
+  import { colOf, isWall, rowOf } from '../lib/types';
   import { validateBoard } from '../lib/validation';
   import { preparePuzzle, solve, maskToDigits, type SolveResult } from '../lib/solver';
   import { deserialize, serialize } from '../lib/stores/boardStore';
+  import { createSafeHintSession, type SafeHint } from '../lib/hint';
   import WitnessGrid from '../components/WitnessGrid.svelte';
   import { SAMPLE_BOARD } from '../lib/sample';
 
@@ -16,6 +17,16 @@
   let solution: SolveResult | null = null;
   let showSolution = false;
   let selected = -1;
+
+  // 安全提示：会话状态是页面文案、确认填入与格子高亮的唯一共同来源。
+  const hintSession = createSafeHintSession();
+  let hintResult: SafeHint | null = null;
+  let hintStale = false;
+  let hintComputing = false;
+  function syncHint(): void {
+    hintResult = hintSession.state.result;
+    hintStale = hintSession.state.stale;
+  }
 
   function loadInitial(): Board {
     try {
@@ -70,6 +81,13 @@
     completeCount = filled;
   }
   $: entries, board, recomputeChecks();
+  // 棋盘、线索或任一已填数字变化，旧安全提示立即失效。
+  $: board, entries, onHintInputsChanged();
+
+  function onHintInputsChanged(): void {
+    hintSession.invalidate();
+    syncHint();
+  }
 
   $: totalRuns = validation.ok && validation.runs ? validation.runs.runs.length : 0;
   $: allFilled = whiteIndices.every((i) => entries[i] !== '');
@@ -84,6 +102,8 @@
   function clearEntries() {
     entries = board.cells.map(() => '');
     showSolution = false;
+    hintSession.dismiss();
+    syncHint();
   }
 
   function loadJson() {
@@ -92,6 +112,8 @@
       entries = board.cells.map(() => '');
       solution = null;
       showSolution = false;
+      hintSession.dismiss();
+      syncHint();
       jsonError = '';
     } catch (e) {
       jsonError = e instanceof Error ? e.message : String(e);
@@ -109,6 +131,8 @@
       entries = board.cells.map(() => '');
       solution = null;
       showSolution = false;
+      hintSession.dismiss();
+      syncHint();
       jsonError = '';
     } catch (e) {
       jsonError = e instanceof Error ? e.message : String(e);
@@ -122,6 +146,38 @@
       return;
     }
     solution = solve(prep);
+  }
+
+  async function requestHint() {
+    if (hintComputing || !validation.ok) return;
+    hintComputing = true;
+    // 让出一帧，先渲染“计算中”。
+    await new Promise((res) => setTimeout(res, 0));
+    try {
+      hintSession.request(board, entries);
+    } catch (e) {
+      jsonError = e instanceof Error ? e.message : String(e);
+    }
+    hintComputing = false;
+    syncHint();
+  }
+
+  // 提示只预览：玩家确认后才把数字写入对应格。
+  function confirmHint() {
+    const apply = hintSession.confirm();
+    if (!apply) return;
+    entries = entries.map((x, i) => (i === apply.cell ? String(apply.digit) : x));
+    syncHint(); // 会话已清空；随后的失效反应面对空状态，为 no-op。
+  }
+
+  function dismissHint() {
+    hintSession.dismiss();
+    syncHint();
+  }
+
+  function hintRowCol(cell: number | null): { r: number; c: number } | null {
+    if (cell === null) return null;
+    return { r: rowOf(board, cell) + 1, c: colOf(board, cell) + 1 };
   }
 
   function candidateList(cell: number): number[] {
@@ -169,11 +225,17 @@
                     validation.runs.runs.some(
                       (run, ri) => wrongSumRuns.has(ri) && run.cells.includes(i)
                     )}
+                  {@const isHintTarget =
+                    hintResult !== null &&
+                    !hintStale &&
+                    hintResult.status === 'hint' &&
+                    hintResult.cell === i}
                   <td
                     class="white playable"
                     class:conflict={conflictCells.has(i)}
                     class:wrong={inWrongRun}
                     class:selected={selected === i}
+                    class:hint-target={isHintTarget}
                   >
                     <input
                       class="digit-input"
@@ -184,6 +246,9 @@
                       on:focus={() => (selected = i)}
                       on:input={(e) => onDigit(i, e.currentTarget)}
                     />
+                    {#if isHintTarget && entries[i] === ''}
+                      <span class="hint-preview">{hintResult?.digit}</span>
+                    {/if}
                     {#if selected === i && solution}
                       <div class="cand-popup">
                         候选：{candidateList(i).length ? candidateList(i).join(' ') : '空'}
@@ -199,6 +264,9 @@
 
       <div class="toolbar" style="margin-top: 12px">
         <button on:click={clearEntries}>清空填写</button>
+        <button on:click={requestHint} disabled={!validation.ok || hintComputing} class="safe-hint">
+          {hintComputing ? '提示计算中…' : '安全提示'}
+        </button>
         <button class="primary" on:click={analyze} disabled={!validation.ok}>求解 / 唯一性分析</button>
         {#if allFilled}
           {#if solved}
@@ -210,6 +278,33 @@
           <span class="muted">已满足线段：{completeCount}/{totalRuns}</span>
         {/if}
       </div>
+
+      {#if hintResult}
+        {@const rc = hintRowCol(hintResult.cell)}
+        <div
+          class="result-banner hint-banner {hintResult.status}"
+          class:stale={hintStale}
+          role="status"
+        >
+          {#if hintResult.status === 'contradiction'}
+            局面矛盾：以你当前已填的数字为固定条件，不存在任何完整合法填法。请检查已填数字（你的输入不会被清空）。
+          {:else if hintResult.status === 'hint'}
+            安全提示：第 {rc?.r} 行第 {rc?.c} 列在所有可行填法中都为
+            <strong>{hintResult.digit}</strong>。
+            {#if !hintStale}
+              <button class="primary" on:click={confirmHint}>确认填入</button>
+            {/if}
+          {:else if hintResult.status === 'no-clue'}
+            暂无线索：没有任何空格能被全部可行填法唯一确定（继续尝试或运行唯一性分析）。
+          {:else}
+            搜索超限：存在性查询触及节点上限，安全提示未知——未查完的候选不会被当作不可能。
+          {/if}
+          <div class="hint-actions">
+            {#if hintStale}<span class="stale-note">棋盘或已填数字已变化，此提示已失效。</span>{/if}
+            <button on:click={dismissHint}>关闭提示</button>
+          </div>
+        </div>
+      {/if}
     </div>
 
     {#if solution && showSolution}
@@ -249,6 +344,8 @@
             board = SAMPLE_BOARD;
             entries = board.cells.map(() => '');
             solution = null;
+            hintSession.dismiss();
+            syncHint();
           }}>内置示例</button
         >
       </div>
@@ -333,5 +430,55 @@
     border-radius: 6px;
     white-space: nowrap;
     pointer-events: none;
+  }
+  button.safe-hint {
+    border-color: var(--ok);
+    color: var(--ok);
+    font-weight: 600;
+  }
+  td.hint-target {
+    background: #e7f8ef;
+    outline: 3px solid var(--ok);
+    outline-offset: -3px;
+  }
+  .hint-preview {
+    position: absolute;
+    right: 3px;
+    top: 1px;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--ok);
+    opacity: 0.75;
+    pointer-events: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .result-banner.hint {
+    color: var(--ok);
+    background: #e9f7f0;
+    border-color: #bfe4d2;
+  }
+  .result-banner.hint button {
+    margin-left: 10px;
+  }
+  .result-banner.contradiction {
+    color: var(--bad);
+    background: #fdecec;
+    border-color: #f2c0c0;
+  }
+  .result-banner.unknown {
+    color: var(--warn);
+    background: #fdf3e7;
+    border-color: #f0d3ad;
+  }
+  .result-banner.no-clue {
+    color: var(--ink-soft);
+    background: #f3f5f8;
+    border-color: var(--line);
+  }
+  .hint-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
   }
 </style>

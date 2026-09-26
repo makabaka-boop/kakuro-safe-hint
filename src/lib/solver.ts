@@ -38,7 +38,7 @@ export interface SolveResult {
 
 export const DIGIT_MASK_ALL = ((1 << (MAX_DIGIT + 1)) - 1) & ~1; // 位 1..9
 
-const DEFAULT_NODE_LIMIT = 500_000;
+export const DEFAULT_NODE_LIMIT = 500_000;
 
 interface PreparedRun extends Run {
   combos: number[][];
@@ -290,11 +290,49 @@ export function solve(
     };
   }
 
+  const allSingletons = p.whiteCells.every((i) => popcount(propagatedDomains[i]) === 1);
+
+  const outcome = searchWitnesses(p, propagatedDomains.slice(), 2, nodeLimit);
+
+  if (outcome.limitHit) {
+    return {
+      status: 'limit',
+      witnesses: outcome.witnesses,
+      domains: Array.from(propagatedDomains),
+      propagationSolved: allSingletons,
+      nodes: outcome.nodes
+    };
+  }
+  return {
+    status:
+      outcome.witnesses.length === 0
+        ? 'unsat'
+        : outcome.witnesses.length === 1
+          ? 'unique'
+          : 'multiple',
+    witnesses: outcome.witnesses,
+    domains: Array.from(propagatedDomains),
+    propagationSolved: allSingletons,
+    nodes: outcome.nodes
+  };
+}
+
+/**
+ * 回溯搜索核心：在已传播的候选域上严格按行优先、数字从小到大分支，
+ * 每找到 maxWitnesses 个完整合法填法即停止；节点数触顶同样立即停止。
+ *
+ * 求解（收集前两个见证）与存在性查询（只要一个见证）共用本函数，
+ * 保证“安全提示”用的就是与唯一性分析同一套约束传播/回溯引擎。
+ */
+function searchWitnesses(
+  p: PreparedPuzzle,
+  startDomains: Uint16Array,
+  maxWitnesses: number,
+  nodeLimit: number
+): { witnesses: number[][]; nodes: number; limitHit: boolean } {
   let nodes = 0;
   let limitHit = false;
   const witnesses: number[][] = [];
-
-  const allSingletons = p.whiteCells.every((i) => popcount(propagatedDomains[i]) === 1);
 
   const readSolution = (domains: Uint16Array): number[] =>
     p.whiteCells.map((i) => {
@@ -320,7 +358,7 @@ export function solve(
   };
 
   const dfs = (domains: Uint16Array, nextWhite: number): void => {
-    if (witnesses.length >= 2 || limitHit) return;
+    if (witnesses.length >= maxWitnesses || limitHit) return;
     nodes++;
     if (nodes > nodeLimit) {
       limitHit = true;
@@ -348,27 +386,54 @@ export function solve(
         continue;
       }
       dfs(child, wi + 1);
-      if (witnesses.length >= 2 || limitHit) return;
+      if (witnesses.length >= maxWitnesses || limitHit) return;
     }
   };
 
-  dfs(propagatedDomains.slice(), 0);
+  dfs(startDomains, 0);
+  return { witnesses, nodes, limitHit };
+}
 
-  if (limitHit) {
-    return {
-      status: 'limit',
-      witnesses,
-      domains: Array.from(propagatedDomains),
-      propagationSolved: allSingletons,
-      nodes
-    };
+export type ExistsStatus = 'sat' | 'unsat' | 'limit';
+
+export interface ExistsResult {
+  status: ExistsStatus;
+  nodes: number;
+}
+
+/**
+ * 存在性查询：在把 fixed 当作“已固定填法”的条件下，是否还存在一份完整合法填法。
+ *
+ * fixed 按棋盘格索引：1～9 表示玩家已填、null/undefined 表示空格。
+ * 不修改玩家输入本身 —— 只是把固定值收窄进候选域后跑同一套传播 + 回溯，
+ * 找到任意一份填法即停。搜索触顶时如实返回 'limit'（未知），
+ * 调用方绝不能把它当作 'unsat'。
+ */
+export function existsSolution(
+  p: PreparedPuzzle,
+  fixed: ReadonlyArray<number | null | undefined>,
+  nodeLimit = DEFAULT_NODE_LIMIT
+): ExistsResult {
+  const domains = initialDomains(p);
+  for (const cell of p.whiteCells) {
+    const d = fixed[cell];
+    if (d === null || d === undefined) continue;
+    if (!Number.isInteger(d) || d < MIN_DIGIT || d > MAX_DIGIT) {
+      return { status: 'unsat', nodes: 0 };
+    }
+    domains[cell] = 1 << d;
   }
+  try {
+    propagate(p, domains, p.runs.map((_, i) => i));
+  } catch {
+    return { status: 'unsat', nodes: 0 };
+  }
+
+  const outcome = searchWitnesses(p, domains.slice(), 1, nodeLimit);
+  if (outcome.limitHit) return { status: 'limit', nodes: outcome.nodes };
   return {
-    status: witnesses.length === 0 ? 'unsat' : witnesses.length === 1 ? 'unique' : 'multiple',
-    witnesses,
-    domains: Array.from(propagatedDomains),
-    propagationSolved: allSingletons,
-    nodes
+    status: outcome.witnesses.length > 0 ? 'sat' : 'unsat',
+    nodes: outcome.nodes
   };
 }
 
